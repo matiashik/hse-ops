@@ -1,20 +1,52 @@
 """DNS-сервис: хранит A-записи (домен -> IPv4-адрес)."""
 
 import ipaddress
+import logging
 import os
 import re
+import time
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, Request
 from pydantic import BaseModel, field_validator
 
 load_dotenv()
 
 APP_NAME = os.getenv("APP_NAME", "DNS-сервис")
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("dns_service")
 
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Запуск %s %s", APP_NAME, APP_VERSION)
+    yield
+    logger.info("Остановка сервиса")
+
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info(
+        "%s %s -> %d (%.1f мс)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 LABEL = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
@@ -118,11 +150,13 @@ def create_record(
     data: RecordIn,
 ):
     if data.name in records:
+        logger.warning("Конфликт: запись %s уже существует", data.name)
         raise HTTPException(
             status_code=409, detail=f"Запись {data.name} уже существует"
         )
     record = Record(name=data.name, ip=data.ip)
     records[record.name] = record
+    logger.info("Создана запись %s A %s", record.name, record.ip)
     return record
 
 
@@ -134,6 +168,7 @@ def update_record(
     record = get_or_404(name)
     updated = record.model_copy(update={"ip": data.ip})
     records[updated.name] = updated
+    logger.info("Обновлена запись %s A %s", updated.name, updated.ip)
     return updated
 
 
@@ -143,3 +178,4 @@ def delete_record(
 ):
     record = get_or_404(name)
     del records[record.name]
+    logger.info("Удалена запись %s A %s", record.name, record.ip)
