@@ -4,11 +4,12 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Request
+from fastapi import FastAPI, Header, HTTPException, Path, Request
 from pydantic import BaseModel, field_validator
 
 load_dotenv()
@@ -16,6 +17,7 @@ load_dotenv()
 APP_NAME = os.getenv("APP_NAME", "DNS-сервис")
 APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+ADMIN_KEY = os.getenv("ADMIN_KEY", "")
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -27,6 +29,8 @@ logger = logging.getLogger("dns_service")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Запуск %s %s", APP_NAME, APP_VERSION)
+    if not ADMIN_KEY:
+        logger.warning("ADMIN_KEY не задан: создание, изменение и удаление записей недоступны")
     yield
     logger.info("Остановка сервиса")
 
@@ -120,6 +124,17 @@ def get_or_404(name: str) -> Record:
     return record
 
 
+def require_admin(admin_key: str | None) -> None:
+    if not admin_key:
+        logger.warning("Отказ: нет заголовка X-Admin-Key")
+        raise HTTPException(status_code=401, detail="Нужен заголовок X-Admin-Key")
+    if not ADMIN_KEY or not secrets.compare_digest(
+        admin_key.encode(), ADMIN_KEY.encode()
+    ):
+        logger.warning("Отказ: неверный ключ администратора")
+        raise HTTPException(status_code=403, detail="Неверный ключ администратора")
+
+
 @app.get("/")
 def root():
     return {"message": "DNS-сервис работает", "docs": "/docs"}
@@ -148,7 +163,9 @@ def get_record(name: str = Path(examples=["example.com"])):
 @app.post("/records", status_code=201)
 def create_record(
     data: RecordIn,
+    x_admin_key: str | None = Header(default=None),
 ):
+    require_admin(x_admin_key)
     if data.name in records:
         logger.warning("Конфликт: запись %s уже существует", data.name)
         raise HTTPException(
@@ -164,7 +181,9 @@ def create_record(
 def update_record(
     name: str,
     data: RecordIp,
+    x_admin_key: str | None = Header(default=None),
 ):
+    require_admin(x_admin_key)
     record = get_or_404(name)
     updated = record.model_copy(update={"ip": data.ip})
     records[updated.name] = updated
@@ -175,7 +194,9 @@ def update_record(
 @app.delete("/records/{name}", status_code=204)
 def delete_record(
     name: str,
+    x_admin_key: str | None = Header(default=None),
 ):
+    require_admin(x_admin_key)
     record = get_or_404(name)
     del records[record.name]
     logger.info("Удалена запись %s A %s", record.name, record.ip)
